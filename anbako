@@ -1,0 +1,1643 @@
+#!/usr/bin/env python
+# @lint-avoid-python-3-compatibility-imports
+
+"""
+anbako: A tool for tracing TCP connect()s, open() syscalls, and exec() syscalls on Linux using BCC and eBPF.
+
+This script is designed to trace network connection attempts (both successful and failed), file opening operations,
+and process executions to help in system diagnostics and troubleshooting. It provides options to filter outputs based
+on various criteria such as process IDs, user IDs, and more.
+
+RECOMMENDED USAGE:
+currently the only supported way to run this command
+only tested on 5.15.154-1-MANJARO
+sudo ./anbako --full-path --dns --fails --quote
+
+Options Description:
+  --full-path     Show the full path of open() for files with relative paths.
+  --dns           Include likely DNS queries associated with each TCP connect.
+  --fails         Include failed exec()s in the output.
+  --quote         For execs, adds quotation marks (") around arguments.
+
+Features:
+- Traces all TCP connect attempts, open system calls, and new processes via exec system calls.
+- Dynamically traces kernel functions, which may require updates to match kernel changes.
+- Supports detailed filtering and output customization to focus on specific events or criteria.
+
+Copyright (c) 2024 Jakub Škoda.
+
+Based on iovisor BCC tools:
+- tcpconnect: https://github.com/iovisor/bcc/blob/master/tools/tcpconnect.py
+- opensnoop: https://github.com/iovisor/bcc/blob/master/tools/opensnoop.py
+- execsnoop: https://github.com/iovisor/bcc/blob/master/tools/execsnoop.py
+
+Contributors:
+- Brendan Gregg: Initial creation and development of the underlying BCC tools.
+- Multiple contributors over the years have added features, improvements, and fixes.
+
+License:
+Licensed under the GNU General Public License (GPL).
+You may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+   http://www.gnu.org/licenses/
+
+Legal:
+This tool is provided "as is", without warranty of any kind, express or implied. The author(s) or
+licensors are not responsible for any damages or issues that arise from using this tool.
+
+TODO:
+- Add tracing for fork() syscalls to capture all new processes, considering some applications may fork() but not exec().
+- Implement automatic post-analysis filtering to focus on specific PIDs that are of interest, and enhance ambient filtering.
+"""
+
+# Standard library imports
+from __future__ import print_function
+import argparse
+import datetime
+from collections import defaultdict
+from io import TextIOWrapper
+import os
+import pwd
+import re
+from socket import inet_ntop, ntohs, AF_INET, AF_INET6
+from struct import pack
+import time
+
+# Third-party imports
+from bcc import BPF, ArgString
+from bcc.containers import filter_by_containers
+from bcc.utils import printb
+
+# DNS dependencies are conditional based on whether DNS options are used.
+try:
+    import dnslib
+    from cachetools import TTLCache
+except ImportError:
+    print("Error: The python packages dnslib and cachetools are required "
+          "to use the -d/--dns option.")
+    print("Install this package with:")
+    print("\t$ pip3 install dnslib cachetools")
+    print("   or")
+    print("\t$ sudo apt-get install python3-dnslib python3-cachetools "
+          "(on Ubuntu 18.04+)")
+    exit(1)
+
+
+class EventType(object):
+    EVENT_ENTRY = 0
+    EVENT_END = 1
+    EVENT_ARG = 0
+    EVENT_RET = 1
+
+
+class FileManager:
+    """
+    Manages file operations for BPF event logging,
+    ensuring files are properly opened and closed.
+    """
+
+    def __init__(self):
+        """
+        Initializes FileManager with paths and handles to
+        manage multiple file operations.
+        """
+        self.file_paths = {
+            'exec': "exec_syscalls.txt",
+            'open': "open_syscalls.txt",
+            'connect': "connect_syscalls.txt"
+        }
+        self.file_handles = {
+            'exec': None,
+            'open': None,
+            'connect': None
+        }
+
+    def open_files(self):
+        """
+        Opens all files specified in file_paths and stores the file handles.
+        """
+        for key, path in self.file_paths.items():
+            self.file_handles[key] = open(path, "w")
+
+    def get_file(self, file_type):
+        """
+        Returns the file handle for the specified type of operation.
+
+        :param file_type: The key to identify which file handle to
+           return (exec, open, connect).
+        :return: File handle of the specified type.
+        """
+        return self.file_handles[file_type]
+
+    def close_files(self):
+        """
+        Closes all open file handles and ensures all resources are
+        properly released.
+        """
+        for key, file in self.file_handles.items():
+            if file:
+                file.close()
+                print(f"Closed file {self.file_paths[key]} successfully.")
+
+
+class ExecEventProcessor:
+    """
+    Processes exec events from eBPF, manages arguments,
+    and logs formatted output.
+
+    This class is designed to monitor and log
+    process execution events, capturing details such as
+    the command name, arguments, and execution result.
+    """
+
+    def __init__(self, b: BPF, args: argparse.Namespace, file: TextIOWrapper):
+        """
+        Initializes the processor with necessary
+        BPF instance, arguments, and output file.
+
+        :param b: BPF instance used to interact with
+          the kernel's BPF subsystem.
+        :param args: Command line arguments encapsulated in
+          an argparse.Namespace.
+        :param file: Open file-like object to which the
+          event logs are written.
+        """
+        self.b = b
+        self.args = args
+        self.file = file
+        self.argv = defaultdict(list)
+        self.start_ts = time.time()
+
+    def get_ppid(self, pid: int) -> int:
+        """
+        Retrieves the parent process ID (PPID) of the given process ID (PID).
+
+        Attempts to fetch the PPID directly from the /proc filesystem.
+        This method is a fallback for when fetching the PPID
+        directly from the task structure fails in the kernel.
+
+        This is best-effort PPID matching. Short-lived processes may exit
+        before we get a chance to read the PPID.
+        This is a fallback for when
+        fetching the PPID from task->real_parent->tgip
+        returns 0, which happens in some kernel versions.
+
+        :param pid: The process ID of the child process.
+        :return: The parent process ID (PPID) or
+          0 if not found or inaccessible.
+        """
+        try:
+            with open(f"/proc/{pid}/status") as status:
+                for line in status:
+                    if line.startswith("PPid:"):
+                        return int(line.split()[1])
+        except IOError:
+            return 0
+
+    def save_event(self, cpu: int, data: int, size: int) -> None:
+        """
+        Handles and logs exec events based on
+        the type of event and command line criteria.
+
+        :param cpu: The CPU number on which the event was captured.
+        :param data: Pointer to the data containing the event information.
+        :param size: Size of the event data.
+        """
+        event = self.b["execs_events"].event(data)
+        skip = False
+
+        if event.type == EventType.EVENT_ARG:
+            self.argv[event.pid].append(event.argv)
+        elif event.type == EventType.EVENT_RET:
+            if event.retval != 0 and not self.args.fails:
+                skip = True
+            if self.args.name_exec and not re.search(
+                self.args.name_exec.encode(), event.comm
+            ):
+                skip = True
+            if self.args.line and not re.search(
+                self.args.line.encode(), b' '.join(self.argv[event.pid])
+            ):
+                skip = True
+            if self.args.quote:
+                self.argv[event.pid] = [
+                    b"\"" + arg.replace(b"\"", b"\\\"") + b"\""
+                    for arg in self.argv[event.pid]
+                ]
+
+            if not skip:
+                output = self.format_output(event)
+                self.file.write(output + "\n")
+            try:
+                del self.argv[event.pid]
+            except KeyError:
+                pass
+
+    def format_output(self, event) -> str:
+        """
+        Formats the output string based on event details
+        and command line options.
+
+        :param event: The event data structure containing process
+           and exec details.
+        :return: Formatted string ready to be written to the output file.
+        """
+        output = ""
+        if self.args.time:
+            output += f"{time.strftime('%H:%M:%S')} "
+        if self.args.timestamp:
+            output += f"{time.time() - self.start_ts:.3f} "
+        if self.args.print_uid:
+            output += f"{event.uid:<6d} "
+
+        ppid = event.ppid if event.ppid > 0 else self.get_ppid(event.pid)
+        ppid = f"{ppid}" if ppid > 0 else "?"
+        argv_text = b' '.join(self.argv[event.pid]).replace(
+            b'\n', b'\\n').decode('utf-8')
+
+        comm_bytes = event.comm.decode(
+            'utf-8') if isinstance(event.comm, bytes) else event.comm
+        if self.args.print_cpu:
+            output += f"{comm_bytes:<16} {event.pid:<7d} {ppid:<7} {event.cpu:<4d} {event.retval:<3d} {argv_text}"
+        else:
+            output += f"{comm_bytes:<16} {event.pid:<7d} {ppid:<7} {event.retval:<3d} {argv_text}"
+
+        return output
+
+
+class OpenEventProcessor:
+    """
+    Processes file open events captured by
+    eBPF and logs them based on specified arguments.
+
+    This class is designed to monitor file open operations,
+    capturing details such as file descriptors, errors,
+    and process identifiers, and then logging those
+    events to a file based on provided filters and options.
+    """
+
+    def __init__(self, b: BPF, args: argparse.Namespace, file: TextIOWrapper):
+        """
+        Initializes the processor with necessary
+        BPF instance, arguments, and output file.
+
+        :param b: BPF instance used to interact with
+           the kernel's BPF subsystem.
+        :param args: Command line arguments encapsulated in
+           an argparse.Namespace.
+        :param file: Open file-like object to which the event logs are written.
+        """
+        self.b = b
+        self.args = args
+        self.file = file
+        self.entries = defaultdict(list)
+        self.initial_ts = 0
+
+    def save_in_file_event(self, cpu: int, data: int, size: int) -> None:
+        """
+        Processes and logs an individual file open event based on its type and the command-line arguments.
+
+        :param cpu: The CPU number on which the event was captured.
+        :param data: Pointer to the data containing the event information.
+        :param size: Size of the event data.
+        """
+        event = self.b["open_events"].event(data)
+        if not self.args.full_path or event.type == EventType.EVENT_END:
+            self.process_event(event)
+        elif event.type == EventType.EVENT_ENTRY:
+            self.store_event_path(event)
+
+    def process_event(self, event) -> None:
+        """
+        Handles the logic of processing each event,
+        determining whether to log it,
+        and formatting the output appropriately.
+
+        :param event: The event data structure.
+        """
+        skip = self.should_skip_event(event)
+        if not skip:
+            output = self.format_output(event)
+            self.file.write(output + "\n")
+        if self.args.full_path:
+            self.entries.pop(event.id, None)
+
+    def should_skip_event(self, event) -> bool:
+        """
+        Determines whether an event should be
+        skipped based on command-line arguments.
+
+        :param event: The event data structure.
+        :return: Boolean indicating whether to skip the event.
+        """
+        if event.ret >= 0 and self.args.failed:
+            return True
+        if self.args.name_open and bytes(self.args.name_open) not in event.comm:
+            return True
+        return False
+
+    def format_output(self, event) -> str:
+        """
+        Formats the event details into a string based on command-line options.
+
+        :param event: The event data structure.
+        :return: Formatted string for logging.
+        """
+        output = ""
+        if self.args.timestamp:
+            delta = event.ts - self.initial_ts
+            output += "%-14.9f" % (delta / 1000000)
+        if self.args.print_uid:
+            output += "%-6d" % event.uid
+
+        comm = event.comm.decode(
+            'utf-8', 'ignore') if isinstance(event.comm, bytes) else event.comm
+        name = event.name.decode(
+            'utf-8', 'ignore') if isinstance(event.name, bytes) else event.name
+        fd_s, err = (event.ret, 0) if event.ret >= 0 else (-1, -event.ret)
+
+        output += "%-6d %-16s %4d %3d " % (
+            event.id & 0xffffffff if self.args.tid else event.id >> 32,
+            comm, fd_s, err)
+
+        if self.args.extended_fields:
+            output += "%08o " % event.flags
+        if not self.args.full_path:
+            output += name
+        else:
+            paths = self.entries[event.id]
+            output += os.path.join(*reversed(paths))
+
+        return output
+
+    def store_event_path(self, event) -> None:
+        """
+        Stores the file path for each event entry to
+        be used when logging the event.
+
+        :param event: The event data structure.
+        """
+        decoded_name = event.name.decode(
+            'utf-8', 'ignore') if isinstance(event.name, bytes) else event.name
+        self.entries[event.id].append(decoded_name)
+
+
+class ConnectEventProcessor:
+    def __init__(
+        self, b: BPF, args: argparse.Namespace, file: TextIOWrapper,
+        DELAY_DNS: int = 100,
+        DNS_CACHE_SIZE: int = 10240,
+        DEFAULT_TTL: int = 86400
+    ):
+        """
+        Initialize the ConnectEventProcessor with
+        configuration options and dependencies.
+        This class processes network events related to
+        the connect() syscall on Linux, optionally handling DNS queries.
+
+        :param b: BPF instance used for interacting
+           with the kernel's BPF subsystem.
+        :param args: Command line arguments encapsulated in
+           an argparse.Namespace.
+        :param file: Text-based file-like object for logging output.
+        :param DELAY_DNS: Milliseconds to delay DNS refresh,
+           affects DNS info update frequency.
+        :param DNS_CACHE_SIZE: Maximum size of the DNS cache.
+        :param DEFAULT_TTL: Default Time To Live for DNS cache entries.
+        """
+        self.b = b
+        self.args = args
+        self.file = file
+        self.DELAY_DNS = DELAY_DNS
+        self.start_ts = 0
+        self.dns_cahe = None
+        if args.dns:
+            self.setup_dns(DNS_CACHE_SIZE, DEFAULT_TTL)
+
+    def setup_dns(self, cache_size: int, ttl: int) -> None:
+        """
+        Sets up the DNS caching mechanism if DNS handling is enabled.
+
+        :param cache_size: Maximum size for the DNS cache.
+        :param ttl: Time to live for each cache entry.
+        """
+        self.dns_cache = TTLCache(maxsize=cache_size, ttl=ttl)
+        # TODO: should I use this import check or is it too ineficient
+        # to import each time
+        # maybe I can just check if it is alrady imported
+        # try:
+        #     from cachetools import TTLCache
+        #     self.dns_cache = TTLCache(maxsize=cache_size, ttl=ttl)
+        # except ImportError as e:
+        #     raise ImportError(
+        #         "Missing required modules for DNS caching. Please install cachetools.") from e
+
+    def resolve_dns_info(self, dest_ip: bytes) -> bytes:
+        """
+        Resolve DNS information for a destination IP,
+        checking cache and formatting output.
+
+        :param dest_ip: The destination IP address as bytes.
+        :return: Formatted DNS information as bytes.
+        """
+        if not self.args.dns or self.dns_cache is None:
+            return b""
+
+        dnsname, timestamp = self.dns_cache.get(dest_ip, (None, None))
+        dnsname = self.format_dns_name(dnsname, dest_ip)
+        diff = self.calculate_time_difference(timestamp)
+
+        retval = dnsname
+        if diff > self.DELAY_DNS:
+            retval += f" ({diff:.3f}ms)".encode()
+        return retval
+
+    def format_dns_name(self, dnsname: bytes, dest_ip: bytes) -> bytes:
+        """
+        Formats the DNS name or assigns a default if not found.
+        """
+        if dnsname is None:
+            dnsname = b"No DNS Query"
+            if dest_ip in (b"127.0.0.1", b"::1"):
+                dnsname = b"localhost"
+        return dnsname
+
+    def calculate_time_difference(self, timestamp: datetime.datetime) -> float:
+        """
+        Calculates time difference in milliseconds
+        since the timestamp provided.
+        """
+        if timestamp is not None:
+            return (datetime.datetime.now() - timestamp).total_seconds() * 1000
+        return 0.0
+
+    def save_dns(self, cpu: int, data: int, size: int) -> None:
+        """
+        Processes DNS events, parses DNS responses, and updates the cache.
+
+        :param cpu: CPU number where the event was captured.
+        :param data: Pointer to the start of the packet data.
+        :param size: Size of the packet data.
+        """
+        event = self.b["dns_events"].event(data)
+        payload = event.pkt[:size]
+        try:
+            dnspkt = dnslib.DNSRecord.parse(payload)
+            if dnspkt.header.qr != 1 or dnspkt.header.q != 1 or (
+                dnspkt.header.a == 0 and dnspkt.header.aa == 0
+            ):
+                return
+            question = str(dnspkt.q.qname).strip('.').encode('utf-8')
+            for answer in dnspkt.rr:
+                if answer.rtype in (1, 28):  # A or AAAA records
+                    self.dns_cache[str(answer.rdata).encode(
+                        'utf-8')] = (question, datetime.datetime.now())
+        except Exception as e:
+            print(f"Error parsing DNS packet: {e}")
+
+    def log_event(
+        self, event, dest_ip: bytes, decode_ip
+    ) -> None:
+        """
+        Logs event details to the output file,
+        extracting and formatting the required information.
+
+        :param event: class 'bcc.table.'
+        :param decode_ip: class 'function'
+        """
+        output = f"{(event.ts_us - self.start_ts) / 1000000:.3f} " if self.args.timestamp else ""
+        output += f"{event.uid:<6} " if self.args.print_uid else ""
+        output += f"{event.pid:<7} {event.task.decode('utf-8'):<12} {event.ip:<2} "
+        output += f"{decode_ip(event.saddr):<40} {event.lport:<6} "
+        output += f"{decode_ip(event.daddr):<40} {event.dport:<6} "
+        output += f"{self.resolve_dns_info(dest_ip).decode('utf-8')}"
+
+        self.file.write(output + "\n")
+
+    def save_ipv4_event(self, cpu: int, data: int, size: int) -> None:
+        """
+        Handles IPv4 network events by
+        logging detailed event information including timestamp,
+        process ID, IP addresses, ports, and resolved DNS names if applicable.
+
+        :param cpu: CPU number where the event was captured.
+        :param data: Pointer to the data buffer containing the event.
+        :param size: Size of the data buffer.
+        """
+        event = self.b["ipv4_events"].event(data)
+        dest_ip = inet_ntop(AF_INET, pack("I", event.daddr)).encode()
+        self.log_event(event, dest_ip, lambda ip: inet_ntop(
+            AF_INET, pack("I", ip)))
+
+    def save_ipv6_event(self, cpu: int, data: int, size: int) -> None:
+        """
+        Handles IPv6 network events by
+        logging detailed event information including timestamp,
+        process ID, IP addresses, ports, and resolved DNS names if applicable.
+
+        :param cpu: CPU number where the event was captured.
+        :param data: Pointer to the data buffer containing the event.
+        :param size: Size of the data buffer.
+        """
+        event = self.b["ipv6_events"].event(data)
+        dest_ip = inet_ntop(AF_INET6, event.daddr).encode()
+        self.log_event(event, dest_ip, lambda ip: inet_ntop(
+            AF_INET6, ip))
+
+
+def save_opensnoop_header(args: argparse.Namespace, file) -> None:
+    """
+    Writes the header line for opensnoop output to the given file based on the provided arguments.
+
+    :param args: Command-line arguments controlling which columns to include.
+    :param file: File object where the header will be written.
+    """
+    headers = []
+    if args.timestamp:
+        headers.append(f"{'TIME(s)':<14}")
+    if args.print_uid:
+        headers.append(f"{'UID':<6}")
+    headers.append(
+        f"{'TID' if args.tid else 'PID':<6} {'COMM':<16} {'FD':<4} {'ERR':<3}")
+    if args.extended_fields:
+        headers.append(f"{'FLAGS':<9}")
+    headers.append("PATH")
+    file.write(' '.join(headers) + "\n")
+
+
+def save_exec_header(args: argparse.Namespace, file) -> None:
+    """
+    Writes the header line for exec tracing output to the given file based on the provided arguments.
+
+    :param args: Command-line arguments controlling which columns to include.
+    :param file: File object where the header will be written.
+    """
+    headers = []
+    if args.time:
+        headers.append(f"{'TIME':<9}")
+    if args.timestamp:
+        headers.append(f"{'TIME(s)':<8}")
+    if args.print_uid:
+        headers.append(f"{'UID':<6}")
+    core_header = f"{'PCOMM':<16} {'PID':<7} {'PPID':<7}"
+    if args.print_cpu:
+        headers.append(f"{core_header} {'CPU':<4} {'RET':<3} {'ARGS'}")
+    else:
+        headers.append(f"{core_header} {'RET':<3} {'ARGS'}")
+    file.write(' '.join(headers) + "\n")
+
+
+def save_tcpconnect_header(args: argparse.Namespace, file) -> None:
+    """
+    Writes the header line for TCP connect tracing output to the given file based on the provided arguments.
+
+    :param args: Command-line arguments controlling which columns to include.
+    :param file: File object where the header will be written.
+    """
+    headers = []
+    if args.timestamp:
+        headers.append(f"{'TIME(s)':<9}")
+    if args.print_uid:
+        headers.append(f"{'UID':<6}")
+    basic_header = f"{'PID':<7} {'COMM':<12} {'IP':<2} {'SADDR':<40} {'DADDR':<40} {'DPORT':<6}"
+    if args.lport:
+        headers.append(f"{'LPORT':<6} {basic_header}")
+    else:
+        headers.append(basic_header)
+    if args.dns:
+        headers.append(" QUERY")
+    file.write(' '.join(headers) + "\n")
+
+
+def depict_cnt(counts_tab, l3prot='ipv4') -> None:
+    """
+    Prints the connection counts sorted by count value,
+    displaying the local and remote addresses,
+    remote port, and the count of connections.
+
+    :param counts_tab: A BPF hash table containing connection
+       counts with keys based on IP addresses and ports.
+    :param l3prot: Layer 3 protocol ('ipv4' or 'ipv6') to
+       adjust address formatting accordingly.
+    """
+    for k, v in sorted(
+        counts_tab.items(), key=lambda item: item[1].value, reverse=True
+    ):
+        if l3prot == 'ipv4':
+            local_addr = inet_ntop(AF_INET, pack('I', k.saddr))
+            remote_addr = inet_ntop(AF_INET, pack('I', k.daddr))
+        else:
+            local_addr = inet_ntop(AF_INET6, k.saddr)
+            remote_addr = inet_ntop(AF_INET6, k.daddr)
+
+        remote_port = k.dport
+        count = v.value
+        print(
+            f"{local_addr:<25} {remote_addr:<25} {remote_port:<20} {count:<10}"
+        )
+
+
+def parse_arguments() -> argparse.Namespace:
+    """
+    Parses command-line arguments for a script syscalls.
+
+    :return: A namespace with the parsed arguments.
+    """
+    # arguments
+    examples = """examples:
+        ./tcpconnect           # trace all TCP connect() and open() syscals
+        ./tcpconnect -T        # include timestamps
+        ./tcpconnect -d        # include DNS queries associated with connects
+        ./tcpconnect -p 181    # only trace PID 181
+        ./tcpconnect -P 80     # only trace port 80
+        ./tcpconnect -P 80,81  # only trace port 80 and 81
+        ./tcpconnect -4        # only trace IPv4 family
+        ./tcpconnect -6        # only trace IPv6 family
+        ./tcpconnect -U        # include UID
+        ./tcpconnect -u 1000   # only trace UID 1000 in open()
+        ./opensnoop -t 123                 # only trace TID 123
+        ./tcpconnect -c        # count connects per src ip and dest ip/port
+        ./tcpconnect -L        # include LPORT while printing outputs
+        ./tcpconnect --cgroupmap mappath  # only trace cgroups in this BPF map
+        ./tcpconnect --mntnsmap mappath  # only trace mount namespaces in the map
+        ./opensnoop --duration 10         # trace open() for 10 seconds only
+        ./opensnoop -f O_WRONLY -f O_RDWR  # only print calls for writing
+        ./opensnoop -F                     # show full path for an open file with relative path
+        ./opensnoop -x                     # only show failed opens
+        ./execsnoop --fails                     # include failed exec()s
+        ./opensnoop -n main                # only print process names containing "main"
+        ./opensnoop -e                     # show extended fields
+        ./execsnoop --ppid 181             # only trace new processes whose parent PID is 181
+        ./execsnoop -C                   # include CPU
+        ./execsnoop -l tpkg              # only print command where arguments contains "tpkg"
+    """
+
+    def parse_uid(user):
+        try:
+            result = int(user)
+        except ValueError:
+            try:
+                user_info = pwd.getpwnam(user)
+            except KeyError:
+                raise argparse.ArgumentTypeError(
+                    "{0!r} is not valid UID or user entry".format(user))
+            else:
+                return user_info.pw_uid
+        else:
+            # Maybe validate if UID < 0 ?
+            return result
+
+    parser = argparse.ArgumentParser(
+        description="Trace TCP connects and open() syscalls",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=examples
+    )
+    parser.add_argument(
+        "-T", "--timestamp",
+        action="store_true", help="include timestamp on output"
+    )
+    parser.add_argument(
+        "--time", action="store_true",
+        help="for execs include time column on output (HH:MM:SS)"
+    )
+    parser.add_argument(
+        "-p", "--pid",
+        help="trace this PID only"
+    )
+    parser.add_argument(
+        "-P", "--port",
+        help="comma-separated list of destination ports to trace."
+    )
+    parser.add_argument(
+        "--ppid", help="for execs trace this parent PID only"
+    )
+    parser.add_argument(
+        "--duration",
+        help="total duration of trace of open() in seconds"
+    )
+    parser.add_argument(
+        "-t", "--tid",
+        help="trace this TID only in open()"
+    )
+    parser.add_argument(
+        "-f", "--flag_filter", action="append",
+        help="filter of open() on flags argument (e.g., O_WRONLY)"
+    )
+    parser.add_argument(
+        "-F", "--full-path", action="store_true",
+        help="show full path of ooen() for an open file with relative path"
+    )
+    parser.add_argument(
+        "-x", "--failed", action="store_true",
+        help="for open() only show failed opens"
+    )
+    parser.add_argument(
+        "--fails", action="store_true", help="include failed exec()s"
+    )
+    parser.add_argument(
+        "-n", "--name_open", type=ArgString,
+        help="for open() only print process names containing this name"
+    )
+    parser.add_argument(
+        "--name_exec", type=ArgString,
+        help="only print commands matching this name (regex), any arg"
+    )
+    parser.add_argument(
+        "-e", "--extended_fields", action="store_true",
+        help="for open() show extended fields"
+    )
+    parser.add_argument(
+        "-b", "--buffer-pages", type=int, default=64,
+        help="for open() size of the perf ring buffer "
+        "(must be a power of two number of pages and defaults to 64)"
+    )
+    parser.add_argument(
+        "-q", "--quote", action="store_true",
+        help="for execs Add quotemarks (\") around arguments."
+    )
+    parser.add_argument(
+        "-l", "--line", type=ArgString,
+        help="execs only print commands where arg contains this line (regex)"
+    )
+    parser.add_argument(
+        "-C", "--print-cpu", action="store_true",
+        help="print CPU column"
+    )
+    parser.add_argument(
+        "--max-args", default="20",
+        help="for execs maximum number of arguments parsed and displayed, defaults to 20"
+    )
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "-4", "--ipv4", action="store_true",
+        help="trace IPv4 family only"
+    )
+    group.add_argument(
+        "-6", "--ipv6", action="store_true",
+        help="trace IPv6 family only"
+    )
+    parser.add_argument(
+        "-L", "--lport", action="store_true",
+        help="include LPORT on output"
+    )
+    parser.add_argument(
+        "-U", "--print-uid", action="store_true",
+        help="include UID on output"
+    )
+    parser.add_argument(
+        "-u", "--uid", type=parse_uid, metavar='USER',
+        help="trace this UID only"
+    )
+    parser.add_argument(
+        "-c", "--count", action="store_true",
+        help="count connects per src ip and dest ip/port"
+    )
+    parser.add_argument(
+        "--debug", action="store_true",
+        help="prints bpf C code and arguments value"
+    )
+    parser.add_argument(
+        "--cgroupmap",
+        help="trace cgroups in this BPF map only"
+    )
+    parser.add_argument(
+        "--mntnsmap",
+        help="trace mount namespaces in this BPF map only"
+    )
+    parser.add_argument(
+        "-d", "--dns", action="store_true",
+        help="include likely DNS query associated with each connect"
+    )
+    parser.add_argument(
+        "--ebpf", action="store_true",
+        help=argparse.SUPPRESS
+    )
+    return parser.parse_args()
+
+
+def check_dependencies():
+    required_modules = {
+        'dnslib': "pip3 install dnslib",
+        'cachetools': "pip3 install cachetools"
+    }
+    missing_modules = []
+    for module in required_modules:
+        try:
+            __import__(module)
+        except ImportError:
+            missing_modules.append(module)
+
+    if missing_modules:
+        error_message = "Error: The following Python packages are required but not installed:\n"
+        for module in missing_modules:
+            error_message += f"- {module}: install using '{required_modules[module]}'\n"
+        raise ImportError(error_message)
+
+
+def bpf_text_ready() -> str:
+    # TODO: make code more modular, so it can change given the kernel version
+    # TODO: currently changing arguments doesn't work, needs to be adited in
+    return """
+        static inline int _cgroup_filter() {
+            return 0;
+        }
+
+        static inline int _mntns_filter() {
+            return 0;
+        }
+
+    static inline int container_should_be_filtered() {
+        return _cgroup_filter() || _mntns_filter();
+    }
+
+    // used by both
+    #include <uapi/linux/ptrace.h>
+
+    // exec
+    #include <linux/sched.h>
+    #include <linux/fs.h>
+    #define ARGSIZE  128
+
+    // tcpconnect
+    #include <net/sock.h>
+    #include <bcc/proto.h>
+
+
+    // opensnoop
+    #define FULLPATH
+
+    #include <uapi/linux/limits.h>
+    #include <linux/sched.h>
+    #ifdef FULLPATH
+    #include <linux/fs_struct.h>
+    #include <linux/dcache.h>
+
+    #define MAX_ENTRIES 32
+
+    enum event_type_open {
+        EVENT_ENTRY,
+        EVENT_END,
+    };
+    #endif
+
+
+    // data strucures
+    // exec
+    enum event_type_exec {
+        EVENT_ARG,
+        EVENT_RET,
+    };
+
+    struct exec_data_t {
+        u32 pid;  // PID as in the userspace term (i.e. task->tgid in kernel)
+        u32 ppid; // Parent PID as in the userspace term (i.e task->real_parent->tgid in kernel)
+        u32 uid;
+        u32 cpu;
+        char comm[TASK_COMM_LEN];
+        enum event_type_exec type;
+        char argv[ARGSIZE];
+        int retval;
+    };
+
+    BPF_PERF_OUTPUT(execs_events);
+    // opensnoop
+    struct val_t {
+        u64 id;
+        char comm[TASK_COMM_LEN];
+        const char *fname;
+    };
+
+    struct open_data_t {
+        u64 id;
+        u64 ts;
+        u32 uid;
+        int ret;
+        char comm[TASK_COMM_LEN];
+    #ifdef FULLPATH
+        enum event_type_open type;
+    #endif
+        char name[NAME_MAX];
+    };
+
+    BPF_PERF_OUTPUT(open_events);
+
+    // tcpconnect
+    BPF_HASH(currsock, u32, struct sock *);
+
+    // separate data structs for ipv4 and ipv6
+    struct ipv4_data_t {
+        u64 ts_us;
+        u32 pid;
+        u32 uid;
+        u32 saddr;
+        u32 daddr;
+        u64 ip;
+        u16 lport;
+        u16 dport;
+        char task[TASK_COMM_LEN];
+    };
+    BPF_PERF_OUTPUT(ipv4_events);
+
+    struct ipv6_data_t {
+        u64 ts_us;
+        u32 pid;
+        u32 uid;
+        unsigned __int128 saddr;
+        unsigned __int128 daddr;
+        u64 ip;
+        u16 lport;
+        u16 dport;
+        char task[TASK_COMM_LEN];
+    };
+    BPF_PERF_OUTPUT(ipv6_events);
+
+    // separate flow keys per address family
+    struct ipv4_flow_key_t {
+        u32 saddr;
+        u32 daddr;
+        u16 dport;
+    };
+    BPF_HASH(ipv4_count, struct ipv4_flow_key_t);
+
+    struct ipv6_flow_key_t {
+        unsigned __int128 saddr;
+        unsigned __int128 daddr;
+        u16 dport;
+    };
+    BPF_HASH(ipv6_count, struct ipv6_flow_key_t);
+
+    // functions
+    // exec
+    static int __submit_arg(struct pt_regs *ctx, void *ptr, struct exec_data_t *data)
+    {
+        bpf_probe_read_user(data->argv, sizeof(data->argv), ptr);
+        execs_events.perf_submit(ctx, data, sizeof(struct exec_data_t));
+        return 1;
+    }
+
+    static int submit_arg_execve(struct pt_regs *ctx, void *ptr, struct exec_data_t *data)
+    {
+        const char *argp = NULL;
+        bpf_probe_read_user(&argp, sizeof(argp), ptr);
+        if (argp) {
+            return __submit_arg(ctx, (void *)(argp), data);
+        }
+        return 0;
+    }
+
+    int syscall__execve(struct pt_regs *ctx,
+        const char __user *filename,
+        const char __user *const __user *__argv,
+        const char __user *const __user *__envp)
+    {
+
+        u32 uid = bpf_get_current_uid_gid() & 0xffffffff;
+
+        if (container_should_be_filtered()) {
+            return 0;
+        }
+
+        // create data here and pass to submit_arg_execve to save stack space (#555)
+        struct exec_data_t data = {};
+        struct task_struct *task;
+
+        data.pid = bpf_get_current_pid_tgid() >> 32;
+
+        task = (struct task_struct *)bpf_get_current_task();
+        // Some kernels, like Ubuntu 4.13.0-generic, return 0
+        // as the real_parent->tgid.
+        // We use the get_ppid function as a fallback in those cases. (#1883)
+        data.ppid = task->real_parent->tgid;
+
+        bpf_get_current_comm(&data.comm, sizeof(data.comm));
+        data.type = EVENT_ARG;
+
+        __submit_arg(ctx, (void *)filename, &data);
+
+        // skip first arg, as we submitted filename
+        #pragma unroll
+        for (int i = 1; i < 20; i++) {
+            if (submit_arg_execve(ctx, (void *)&__argv[i], &data) == 0)
+                 goto out;
+        }
+
+        // handle truncated argument list
+        char ellipsis[] = "...";
+        __submit_arg(ctx, (void *)ellipsis, &data);
+    out:
+        return 0;
+    }
+
+    int do_ret_sys_execve(struct pt_regs *ctx)
+    {
+        if (container_should_be_filtered()) {
+            return 0;
+        }
+
+        struct exec_data_t data = {};
+        struct task_struct *task;
+
+        u32 uid = bpf_get_current_uid_gid() & 0xffffffff;
+
+        data.pid = bpf_get_current_pid_tgid() >> 32;
+        data.uid = uid;
+
+        task = (struct task_struct *)bpf_get_current_task();
+        // Some kernels, like Ubuntu 4.13.0-generic, return 0
+        // as the real_parent->tgid.
+        // We use the get_ppid function as a fallback in those cases. (#1883)
+        data.ppid = task->real_parent->tgid;
+        data.cpu = task->cpu;
+
+        bpf_get_current_comm(&data.comm, sizeof(data.comm));
+        data.type = EVENT_RET;
+        data.retval = PT_REGS_RC(ctx);
+        execs_events.perf_submit(ctx, &data, sizeof(data));
+
+        return 0;
+    }
+
+    // opensnoop
+    #if defined(CONFIG_ARCH_HAS_SYSCALL_WRAPPER) && !defined(__s390x__)
+    KRETFUNC_PROBE(__x64_sys_open, struct pt_regs *regs, int ret)
+    {
+        const char __user *filename = (char *)PT_REGS_PARM1(regs);
+        int flags = PT_REGS_PARM2(regs);
+    #else
+    KRETFUNC_PROBE(__x64_sys_open, const char __user *filename, int flags, int ret)
+    {
+    #endif
+
+        u64 id = bpf_get_current_pid_tgid();
+        u32 pid = id >> 32; // PID is higher part
+        u32 tid = id;       // Cast and get the lower part
+        u32 uid = bpf_get_current_uid_gid();
+
+        if (container_should_be_filtered()) {
+            return 0;
+        }
+
+        struct open_data_t data = {};
+        bpf_get_current_comm(&data.comm, sizeof(data.comm));
+
+        u64 tsp = bpf_ktime_get_ns();
+
+        bpf_probe_read_user_str(&data.name, sizeof(data.name), (void *)filename);
+        data.id    = id;
+        data.ts    = tsp / 1000;
+        data.uid   = bpf_get_current_uid_gid();
+        data.ret   = ret;
+
+        data.type = EVENT_ENTRY;
+        open_events.perf_submit(ctx, &data, sizeof(data));
+
+        if (data.name[0] != '/') { // relative path
+            struct task_struct *task;
+            struct dentry *dentry;
+            int i;
+
+            task = (struct task_struct *)bpf_get_current_task_btf();
+            dentry = task->fs->pwd.dentry;
+
+            for (i = 1; i < MAX_ENTRIES; i++) {
+                bpf_probe_read_kernel(&data.name, sizeof(data.name), (void *)dentry->d_name.name);
+                data.type = EVENT_ENTRY;
+                open_events.perf_submit(ctx, &data, sizeof(data));
+
+                if (dentry == dentry->d_parent) { // root directory
+                    break;
+                }
+
+                dentry = dentry->d_parent;
+            }
+        }
+
+        data.type = EVENT_END;
+        open_events.perf_submit(ctx, &data, sizeof(data));
+
+        return 0;
+    }
+
+    #if defined(CONFIG_ARCH_HAS_SYSCALL_WRAPPER) && !defined(__s390x__)
+    KRETFUNC_PROBE(__x64_sys_openat, struct pt_regs *regs, int ret)
+    {
+        int dfd = PT_REGS_PARM1(regs);
+        const char __user *filename = (char *)PT_REGS_PARM2(regs);
+        int flags = PT_REGS_PARM3(regs);
+    #else
+    KRETFUNC_PROBE(__x64_sys_openat, int dfd, const char __user *filename, int flags, int ret)
+    {
+    #endif
+
+        u64 id = bpf_get_current_pid_tgid();
+        u32 pid = id >> 32; // PID is higher part
+        u32 tid = id;       // Cast and get the lower part
+        u32 uid = bpf_get_current_uid_gid();
+
+        if (container_should_be_filtered()) {
+            return 0;
+        }
+
+        struct open_data_t data = {};
+        bpf_get_current_comm(&data.comm, sizeof(data.comm));
+
+        u64 tsp = bpf_ktime_get_ns();
+
+        bpf_probe_read_user_str(&data.name, sizeof(data.name), (void *)filename);
+        data.id    = id;
+        data.ts    = tsp / 1000;
+        data.uid   = bpf_get_current_uid_gid();
+        data.ret   = ret;
+
+        data.type = EVENT_ENTRY;
+        open_events.perf_submit(ctx, &data, sizeof(data));
+
+        if (data.name[0] != '/') { // relative path
+            struct task_struct *task;
+            struct dentry *dentry;
+            int i;
+
+            task = (struct task_struct *)bpf_get_current_task_btf();
+            dentry = task->fs->pwd.dentry;
+
+            for (i = 1; i < MAX_ENTRIES; i++) {
+                bpf_probe_read_kernel(&data.name, sizeof(data.name), (void *)dentry->d_name.name);
+                data.type = EVENT_ENTRY;
+                open_events.perf_submit(ctx, &data, sizeof(data));
+
+                if (dentry == dentry->d_parent) { // root directory
+                    break;
+                }
+
+                dentry = dentry->d_parent;
+            }
+        }
+
+        data.type = EVENT_END;
+        open_events.perf_submit(ctx, &data, sizeof(data));
+
+        return 0;
+    }
+
+    #include <uapi/linux/openat2.h>
+    #if defined(CONFIG_ARCH_HAS_SYSCALL_WRAPPER) && !defined(__s390x__)
+    KRETFUNC_PROBE(__x64_sys_openat2, struct pt_regs *regs, int ret)
+    {
+        int dfd = PT_REGS_PARM1(regs);
+        const char __user *filename = (char *)PT_REGS_PARM2(regs);
+        struct open_how __user how;
+        int flags;
+
+        bpf_probe_read_user(&how, sizeof(struct open_how), (struct open_how*)PT_REGS_PARM3(regs));
+        flags = how.flags;
+    #else
+    KRETFUNC_PROBE(__x64_sys_openat2, int dfd, const char __user *filename, struct open_how __user *how, int ret)
+    {
+        int flags = how->flags;
+    #endif
+
+        u64 id = bpf_get_current_pid_tgid();
+        u32 pid = id >> 32; // PID is higher part
+        u32 tid = id;       // Cast and get the lower part
+        u32 uid = bpf_get_current_uid_gid();
+
+        if (container_should_be_filtered()) {
+            return 0;
+        }
+
+        struct open_data_t data = {};
+        bpf_get_current_comm(&data.comm, sizeof(data.comm));
+
+        u64 tsp = bpf_ktime_get_ns();
+
+        bpf_probe_read_user_str(&data.name, sizeof(data.name), (void *)filename);
+        data.id    = id;
+        data.ts    = tsp / 1000;
+        data.uid   = bpf_get_current_uid_gid();
+        data.ret   = ret;
+
+        data.type = EVENT_ENTRY;
+        open_events.perf_submit(ctx, &data, sizeof(data));
+
+        if (data.name[0] != '/') { // relative path
+            struct task_struct *task;
+            struct dentry *dentry;
+            int i;
+
+            task = (struct task_struct *)bpf_get_current_task_btf();
+            dentry = task->fs->pwd.dentry;
+
+            for (i = 1; i < MAX_ENTRIES; i++) {
+                bpf_probe_read_kernel(&data.name, sizeof(data.name), (void *)dentry->d_name.name);
+                data.type = EVENT_ENTRY;
+                open_events.perf_submit(ctx, &data, sizeof(data));
+
+                if (dentry == dentry->d_parent) { // root directory
+                    break;
+                }
+
+                dentry = dentry->d_parent;
+            }
+        }
+
+        data.type = EVENT_END;
+        open_events.perf_submit(ctx, &data, sizeof(data));
+
+        return 0;
+    }
+
+
+    //tcpconnect
+    int trace_connect_entry(struct pt_regs *ctx, struct sock *sk)
+    {
+        if (container_should_be_filtered()) {
+            return 0;
+        }
+
+        u64 pid_tgid = bpf_get_current_pid_tgid();
+        u32 pid = pid_tgid >> 32;
+        u32 tid = pid_tgid;
+
+        u32 uid = bpf_get_current_uid_gid();
+
+        // stash the sock ptr for lookup on return
+        currsock.update(&tid, &sk);
+
+        return 0;
+    };
+
+    static int trace_connect_return(struct pt_regs *ctx, short ipver)
+    {
+        int ret = PT_REGS_RC(ctx);
+        u64 pid_tgid = bpf_get_current_pid_tgid();
+        u32 pid = pid_tgid >> 32;
+        u32 tid = pid_tgid;
+
+        struct sock **skpp;
+        skpp = currsock.lookup(&tid);
+        if (skpp == 0) {
+            return 0;   // missed entry
+        }
+
+        if (ret != 0) {
+            // failed to send SYNC packet, may not have populated
+            // socket __sk_common.{skc_rcv_saddr, ...}
+            currsock.delete(&tid);
+            return 0;
+        }
+
+        // pull in details
+        struct sock *skp = *skpp;
+        u16 lport = skp->__sk_common.skc_num;
+        u16 dport = skp->__sk_common.skc_dport;
+
+        if (ipver == 4) {
+
+                   struct ipv4_data_t data4 = {.pid = pid, .ip = ipver};
+                   data4.uid = bpf_get_current_uid_gid();
+                   data4.ts_us = bpf_ktime_get_ns() / 1000;
+                   data4.saddr = skp->__sk_common.skc_rcv_saddr;
+                   data4.daddr = skp->__sk_common.skc_daddr;
+                   data4.lport = lport;
+                   data4.dport = ntohs(dport);
+                   bpf_get_current_comm(&data4.task, sizeof(data4.task));
+                   ipv4_events.perf_submit(ctx, &data4, sizeof(data4));
+        } else /* 6 */ {
+
+                   struct ipv6_data_t data6 = {.pid = pid, .ip = ipver};
+                   data6.uid = bpf_get_current_uid_gid();
+                   data6.ts_us = bpf_ktime_get_ns() / 1000;
+                   bpf_probe_read_kernel(&data6.saddr, sizeof(data6.saddr),
+                       skp->__sk_common.skc_v6_rcv_saddr.in6_u.u6_addr32);
+                   bpf_probe_read_kernel(&data6.daddr, sizeof(data6.daddr),
+                       skp->__sk_common.skc_v6_daddr.in6_u.u6_addr32);
+                   data6.lport = lport;
+                   data6.dport = ntohs(dport);
+                   bpf_get_current_comm(&data6.task, sizeof(data6.task));
+                   ipv6_events.perf_submit(ctx, &data6, sizeof(data6));
+        }
+
+        currsock.delete(&tid);
+
+        return 0;
+    }
+
+    int trace_connect_v4_return(struct pt_regs *ctx)
+    {
+        return trace_connect_return(ctx, 4);
+    }
+
+    int trace_connect_v6_return(struct pt_regs *ctx)
+    {
+        return trace_connect_return(ctx, 6);
+    }
+
+    #include <net/inet_sock.h>
+
+    #define MAX_PKT 512
+    struct dns_data_t {
+        u8  pkt[MAX_PKT];
+    };
+
+    BPF_PERF_OUTPUT(dns_events);
+
+    // store msghdr pointer captured on syscall entry to parse on syscall return
+    BPF_HASH(tbl_udp_msg_hdr, u64, struct msghdr *);
+
+    // single element per-cpu array to hold the current event off the stack
+    BPF_PERCPU_ARRAY(dns_data,struct dns_data_t,1);
+
+    int trace_udp_recvmsg(struct pt_regs *ctx)
+    {
+        __u64 pid_tgid = bpf_get_current_pid_tgid();
+        struct sock *sk = (struct sock *)PT_REGS_PARM1(ctx);
+        struct inet_sock *is = inet_sk(sk);
+
+        // only grab port 53 packets, 13568 is ntohs(53)
+        if (is->inet_dport == 13568) {
+            struct msghdr *msghdr = (struct msghdr *)PT_REGS_PARM2(ctx);
+            tbl_udp_msg_hdr.update(&pid_tgid, &msghdr);
+        }
+        return 0;
+    }
+
+    int trace_udp_ret_recvmsg(struct pt_regs *ctx)
+    {
+        __u64 pid_tgid = bpf_get_current_pid_tgid();
+        u32 zero = 0;
+        struct msghdr **msgpp = tbl_udp_msg_hdr.lookup(&pid_tgid);
+        if (msgpp == 0)
+            return 0;
+
+        struct msghdr *msghdr = (struct msghdr *)*msgpp;
+        if (msghdr->msg_iter.iter_type != ITER_IOVEC)
+            goto delete_and_return;
+
+        int copied = (int)PT_REGS_RC(ctx);
+        if (copied < 0)
+            goto delete_and_return;
+        size_t buflen = (size_t)copied;
+
+        if (buflen > msghdr->msg_iter.iov->iov_len)
+            goto delete_and_return;
+
+        if (buflen > MAX_PKT)
+            buflen = MAX_PKT;
+
+        struct dns_data_t *data = dns_data.lookup(&zero);
+        if (!data) // this should never happen, just making the verifier happy
+            return 0;
+
+        void *iovbase = msghdr->msg_iter.iov->iov_base;
+        bpf_probe_read(data->pkt, buflen, iovbase);
+        dns_events.perf_submit(ctx, data, buflen);
+
+    delete_and_return:
+        tbl_udp_msg_hdr.delete(&pid_tgid);
+        return 0;
+    }
+
+    #include <uapi/linux/udp.h>
+
+    int trace_udpv6_recvmsg(struct pt_regs *ctx)
+    {
+        struct sk_buff *skb = (struct sk_buff *)PT_REGS_PARM2(ctx);
+        struct udphdr *hdr = (void*)skb->head + skb->transport_header;
+        struct dns_data_t *event;
+        int zero = 0;
+        void *data;
+
+        /* hex(53) = 0x0035, htons(0x0035) = 0x3500 */
+        if (hdr->source != 0x3500)
+            return 0;
+
+        /* skip UDP header */
+        data = skb->data + 8;
+
+        event = dns_data.lookup(&zero);
+        if (!event)
+            return 0;
+
+        bpf_probe_read(event->pkt, sizeof(event->pkt), data);
+        dns_events.perf_submit(ctx, event, sizeof(*event));
+        return 0;
+    }
+    """
+
+
+def setup_flag_filters(flag_filter_list):
+    """
+    Sets up flag filters for file open events based on command-line arguments.
+
+    :param flag_filter_list: List of flags provided through command-line.
+    :return: Flag filter mask calculated from provided flags.
+    """
+    flag_filter_mask = 0
+    for flag in flag_filter_list or []:
+        if not flag.startswith('O_'):
+            exit(f"Bad flag: {flag}")
+        try:
+            flag_filter_mask |= getattr(os, flag)
+        except AttributeError:
+            exit(f"Bad flag: {flag}")
+    return flag_filter_mask
+
+
+def check_dns_dependencies(args: argparse.Namespace) -> None:
+    """
+    Checks and verifies necessary dependencies for
+    DNS functionality if specified.
+
+    :param args: Command-line arguments.
+    """
+    if args.dns:
+        try:
+            check_dependencies()
+        except ImportError as e:
+            print(e)
+            exit(1)
+
+
+def setup_exec_event_processor(
+    b: BPF, args: argparse.Namespace, file: TextIOWrapper
+) -> None:
+    """
+    Sets up the event processor for execve system calls.
+
+    :param b: The BPF instance.
+    :param args: Command-line arguments.
+    """
+    save_exec_header(args, file)
+
+    execve_fnname = b.get_syscall_fnname("execve")
+    b.attach_kprobe(event=execve_fnname, fn_name="syscall__execve")
+    b.attach_kretprobe(event=execve_fnname, fn_name="do_ret_sys_execve")
+
+    process_exec = ExecEventProcessor(b, args, file)
+    b["execs_events"].open_perf_buffer(process_exec.save_event)
+
+
+def setup_open_event_processor(
+    b: BPF, args: argparse.Namespace, file: TextIOWrapper
+) -> None:
+    """
+    Sets up the event processor for open system calls.
+
+    :param b: The BPF instance.
+    :param args: Command-line arguments.
+    """
+    save_opensnoop_header(args, file)
+
+    fnname_open = b.get_syscall_prefix().decode() + 'open'
+    fnname_openat = b.get_syscall_prefix().decode() + 'openat'
+    fnname_openat2 = b.get_syscall_prefix().decode() + 'openat2'
+
+    is_support_kfunc = BPF.support_kfunc()
+
+    if b.ksymname(fnname_openat2) == -1:
+        fnname_openat2 = None
+
+    if not is_support_kfunc:
+        b.attach_kprobe(event=fnname_open, fn_name="syscall__trace_entry_open")
+        b.attach_kretprobe(event=fnname_open, fn_name="trace_return")
+        b.attach_kprobe(
+            event=fnname_openat, fn_name="syscall__trace_entry_openat"
+        )
+        b.attach_kretprobe(
+            event=fnname_openat, fn_name="trace_return"
+        )
+
+        if fnname_openat2:
+            b.attach_kprobe(
+                event=fnname_openat2, fn_name="syscall__trace_entry_openat2"
+            )
+            b.attach_kretprobe(event=fnname_openat2, fn_name="trace_return")
+
+    process_open = OpenEventProcessor(b, args, file=file)
+    b["open_events"].open_perf_buffer(
+        process_open.save_in_file_event, page_cnt=args.buffer_pages)
+
+
+def setup_tcp_connect_event_processor(
+    b: BPF, args: argparse.Namespace, file: TextIOWrapper
+) -> None:
+    """
+    Sets up the event processor for TCP connect system calls.
+
+    :param b: The BPF instance.
+    :param args: Command-line arguments.
+    """
+    save_tcpconnect_header(args, file)
+
+    b.attach_kprobe(event="tcp_v4_connect", fn_name="trace_connect_entry")
+    b.attach_kprobe(event="tcp_v6_connect", fn_name="trace_connect_entry")
+    b.attach_kretprobe(
+        event="tcp_v4_connect", fn_name="trace_connect_v4_return"
+    )
+    b.attach_kretprobe(
+        event="tcp_v6_connect", fn_name="trace_connect_v6_return"
+    )
+    if args.dns:
+        b.attach_kprobe(event="udp_recvmsg", fn_name="trace_udp_recvmsg")
+        b.attach_kretprobe(event="udp_recvmsg",
+                           fn_name="trace_udp_ret_recvmsg")
+        b.attach_kprobe(
+            event="udpv6_queue_rcv_one_skb", fn_name="trace_udpv6_recvmsg"
+        )
+
+    process_connect = ConnectEventProcessor(
+        b, args, file,
+        DELAY_DNS=100, DNS_CACHE_SIZE=10240, DEFAULT_TTL=86400
+    ) if args.dns else ConnectEventProcessor(b, args, file)
+    b["ipv4_events"].open_perf_buffer(process_connect.save_ipv4_event)
+    b["ipv6_events"].open_perf_buffer(process_connect.save_ipv6_event)
+    if args.dns:
+        b["dns_events"].open_perf_buffer(process_connect.save_dns)
+
+
+def event_loop(
+    b: BPF, args: argparse.Namespace, file_manager
+) -> None:
+    """
+    Maintains a loop to capture and process BPF events, handles termination gracefully.
+
+    :param b: The BPF instance.
+    :param args: Command-line arguments.
+    """
+    if args.count:
+        try:
+            # Loop intended for counting connections,
+            # runs indefinitely until interrupted.
+            while True:
+                time.sleep(99999999)
+        except KeyboardInterrupt:
+            pass
+
+        # header
+        print("\n%-25s %-25s %-20s %-10s" % (
+            "LADDR", "RADDR", "RPORT", "CONNECTS"))
+        depict_cnt(b["ipv4_count"])
+        depict_cnt(b["ipv6_count"], l3prot='ipv6')
+        file_manager.close_files()
+    else:
+        # Main loop to process all events.
+        try:
+            while True:
+                b.perf_buffer_poll()
+        except KeyboardInterrupt:
+            # Graceful exit on user interrupt (Ctrl-C).
+            print("\nExiting...")
+        finally:
+            file_manager.close_files()
+
+
+def main():
+    """
+    Main entry point for the event processing script.
+
+    This function sets up BPF event monitoring for
+    different system calls like execve, open, and TCP connect.
+    It handles command-line arguments to customize the tracing and
+    logs the events based on specified filters and options.
+    """
+    args = parse_arguments()
+
+    # handle files
+    file_manager = FileManager()
+    file_manager.open_files()
+
+    # Set duration for the tracing
+    if args.duration:
+        args.duration = datetime.timedelta(seconds=int(args.duration))
+
+    # Setup flag filters for open events
+    flag_filter_mask = setup_flag_filters(args.flag_filter)
+
+    # Debug output of arguments if specified
+    if args.debug:
+        print("args: ", args)
+
+    # Prepare the BPF text
+    # (loaded from a predefined source or dynamically generated)
+    bpf_text = bpf_text_ready()
+
+    # Check for required dependencies if DNS tracing is enabled
+    check_dns_dependencies(args)
+
+    # Initialize BPF with the prepared BPF text
+    b = BPF(text=bpf_text)
+
+    # Setup event processors and their respective system call hooks
+    setup_exec_event_processor(b, args, file_manager.get_file('exec'))
+    setup_open_event_processor(b, args, file_manager.get_file('open'))
+    setup_tcp_connect_event_processor(
+        b, args, file_manager.get_file('connect')
+    )
+
+    # Main event loop to capture and process events
+    print("Tracing... Hit Ctrl-C to end.\n")
+    event_loop(b, args, file_manager)
+
+
+if __name__ == "__main__":
+    main()
